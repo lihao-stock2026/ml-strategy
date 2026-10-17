@@ -1,0 +1,29 @@
+# Python 缓存
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+*.log
+
+# 虚拟环境
+venv/
+.venv/
+env/
+
+# 数据缓存（回测生成的csv、图片）
+cache/
+*.csv
+*.png
+*.jpg
+
+# 环境密钥（存放tushare token，绝对不上传github）
+.env
+
+# IDE配置
+.idea/
+.vscode/
+*.iml
+
+# 系统文件
+.DS_Store
+Thumbs.db
