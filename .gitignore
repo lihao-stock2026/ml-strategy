@@ -1,29 +1,53 @@
-# Python 缓存
+# ========= Python 通用忽略 =========
 __pycache__/
-*.pyc
-*.pyo
-*.pyd
-*.log
+*.py[cod]
+*$py.class
+*.so
+.Python
+build/
+develop-eggs/
+dist/
+downloads/
+eggs/
+.eggs/
+lib/
+lib64/
+parts/
+sdist/
+var/
+*.egg-info/
+.installed.cfg
+*.egg
 
-# 虚拟环境
+# ========= 虚拟环境 =========
 venv/
-.venv/
 env/
-
-# 数据缓存（回测生成的csv、图片）
-cache/
-*.csv
-*.png
-*.jpg
-
-# 环境密钥（存放tushare token，绝对不上传github）
+.venv/
 .env
 
-# IDE配置
-.idea/
-.vscode/
-*.iml
+# ========= 项目本地产物【重点！不要上传回测输出、行情缓存】 =========
+# tushare行情缓存文件 cache_xxx.csv
+cache_*.csv
 
-# 系统文件
+# 程序输出：图片、csv报告、txt、log日志
+output/
+
+# 环境配置（存放TUSHARE_TOKEN，绝对不要提交！）
+.env
+
+# ========= IDE编辑器文件 =========
+# PyCharm
+.idea/
+*.iml
+*.iws
+*.out
+*.log
+
+# VS Code
+.vscode/
+*.swp
+*.swo
+
+# ========= 系统文件 =========
 .DS_Store
 Thumbs.db
