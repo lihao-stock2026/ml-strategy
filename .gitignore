@@ -1,53 +1,20 @@
-# ========= Python 通用忽略 =========
+# 私有配置
+.env
+
+# Python缓存
 __pycache__/
-*.py[cod]
-*$py.class
-*.so
-.Python
-build/
-develop-eggs/
-dist/
-downloads/
-eggs/
-.eggs/
-lib/
-lib64/
-parts/
-sdist/
-var/
-*.egg-info/
-.installed.cfg
-*.egg
+*.pyc
+*.pyo
 
-# ========= 虚拟环境 =========
-venv/
-env/
-.venv/
-.env
-
-# ========= 项目本地产物【重点！不要上传回测输出、行情缓存】 =========
-# tushare行情缓存文件 cache_xxx.csv
+# 项目缓存输出
 cache_*.csv
-
-# 程序输出：图片、csv报告、txt、log日志
 output/
-
-# 环境配置（存放TUSHARE_TOKEN，绝对不要提交！）
-.env
-
-# ========= IDE编辑器文件 =========
-# PyCharm
-.idea/
-*.iml
-*.iws
-*.out
 *.log
 
-# VS Code
+# IDE
+.idea/
 .vscode/
-*.swp
-*.swo
 
-# ========= 系统文件 =========
-.DS_Store
-Thumbs.db
+# 虚拟环境
+.venv/
+venv/
