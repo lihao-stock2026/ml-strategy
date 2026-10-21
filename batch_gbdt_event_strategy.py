@@ -338,7 +338,7 @@ def fetch_data_akshare(code: str, start: str, end: str, refresh_cache: bool = Fa
 def build_features(df: pd.DataFrame) -> pd.DataFrame:
     """
     根据原始日线计算全套技术因子与训练标签
-    注意：label使用shift(-5)未来5日数据，仅离线回测使用，实盘禁止使用该标签
+    注意：使用未来窗口价格构造标签，仅离线回测使用，实盘禁止使用该标签
     :param df: 原始日线DataFrame
     :return: 增加因子、label后的DataFrame
     """
@@ -364,9 +364,14 @@ def build_features(df: pd.DataFrame) -> pd.DataFrame:
     df['ret_5d'] = df['close'].pct_change(5)
     df['ret_10d'] = df['close'].pct_change(10)
     df['volatility'] = df['ret_1d'].rolling(14).std()
-    # 注意：shift(-5)使用未来5日价格构造标签，仅离线回测可用；实盘不可获取未来数据（未来函数风险）
+
+    # ----------------------
+    # 【当前启用：原始标签】未来第5日收盘价大于当日，标记上涨样本
+    # 样本分布相对均衡，适合网格搜索观察过拟合；仅离线回测，存在未来函数风险
+    # ----------------------
     df['label'] = (df['close'].shift(-5) > df['close']).astype(np.int64)
     return df
+
 
 def train_predict(df: pd.DataFrame, model_type: str, params: dict, stock_code: str, no_plot: bool):
     """
