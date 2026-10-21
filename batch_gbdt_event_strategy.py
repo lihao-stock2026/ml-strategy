@@ -1,5 +1,5 @@
 """
-batch_gbdt_event_strategy.py v1.5.3【MySQL全链路持久化｜修复数据库连接多次开关问题】
+batch_gbdt_event_strategy.py v1.5.5【MySQL全链路持久化｜双数据源tushare/akshare】
 批量多股票 GBDT(LightGBM/XGBoost可选) + 事件驱动回测
 更新：
 1. 订单生成失败打印资金不足警告（提示可用现金、1手预估成本）
@@ -14,18 +14,25 @@ batch_gbdt_event_strategy.py v1.5.3【MySQL全链路持久化｜修复数据库�
 10.训练输出precision/recall/f1‑score，不再仅依赖accuracy
 11.全部输出统一output文件夹，自动创建
 12.【MySQL优化】单只股票只打开一次数据库连接，全部读写完成finally统一关闭
+13.feat:新增AKShare免费数据源，命令行切换tushare/akshare；akshare延迟导入
+14.fix:聚类预处理跟随--data‑source参数，双数据源都支持聚类实验
+15.feat:训练完成自动输出LGB/XGB特征重要性图，按股票代码命名保存至images目录；--no‑plot统一关闭全部绘图输出
 ⚠️风险免责：本代码仅用于学习演示，不构成任何投资建议。历史回测结果不能代表未来实际收益。
 【运行示例】
 python batch_gbdt_event_strategy.py --codes 600519.SH --start 20200101 --end 20241231 --model lgb
 python batch_gbdt_event_strategy.py --codes 600519.SH --start 20200101 --end 20241231 --model xgb --prob-threshold 0.30 --sell-threshold 0.40
+# 使用免费akshare
+python batch_gbdt_event_strategy.py --codes 600519.SH --start 20200101 --end 20241231 --model lgb --data-source akshare
+# akshare + 聚类
+python batch_gbdt_event_strategy.py --codes 600519.SH --start 20200101 --end 20241231 --model lgb --data-source akshare --enable_cluster --n_cluster 2
 """
 import os
 import glob
-import logging
 import argparse
 import time
 import shlex
 import random
+import logging
 from datetime import datetime
 from dotenv import load_dotenv
 import tushare as ts
@@ -43,10 +50,8 @@ from event_backtest import (
     Event, MarketEvent, SignalEvent, OrderEvent, FillEvent,
     calc_metrics, DataHandler
 )
-import logging
-logger = logging.getLogger(__name__)
 from db_utils import StockDB
-__version__ = "1.5.3"
+__version__ = "1.5.5"
 MAX_BATCH_STOCKS = 20
 API_MIN_INTERVAL = 0.4
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
@@ -56,15 +61,18 @@ os.makedirs(OUTPUT_DIR, exist_ok=True)
 SEED = 42
 np.random.seed(SEED)
 random.seed(SEED)
+
 def safe_shell_join(args_list):
     try:
         return shlex.join(args_list)
     except AttributeError:
         return " ".join(shlex.quote(x) for x in args_list)
+
 try:
     import importlib.metadata
 except ImportError:
     importlib = None
+
 try:
     import matplotlib
     matplotlib.use('TkAgg')
@@ -72,10 +80,26 @@ except Exception:
     import matplotlib
     matplotlib.use('Agg')
 import matplotlib.pyplot as plt
+
 load_dotenv()
 # 多操作系统兼容中文字体：Windows / MacOS / Linux
 plt.rcParams["font.sans-serif"] = ["SimHei", "Microsoft YaHei", "Arial Unicode MS", "WenQuanYi Micro Hei", "Heiti TC"]
 plt.rcParams["axes.unicode_minus"] = False
+
+def setup_logger():
+    log_path = os.path.join(OUTPUT_DIR, "batch_gbdt.log")
+    log_format = "%(asctime)s - %(levelname)s - %(message)s"
+    logging.basicConfig(
+        level=logging.INFO,
+        format=log_format,
+        handlers=[
+            logging.FileHandler(log_path, encoding="utf‑8"),
+            logging.StreamHandler()
+        ]
+    )
+    return logging.getLogger(__name__)
+
+logger = setup_logger()
 
 if importlib is not None:
     try:
@@ -111,6 +135,7 @@ FEATURE_COLS = [
     'vol_change', 'vol_ratio',
     'ret_1d', 'ret_5d', 'ret_10d', 'volatility'
 ]
+
 # 全局策略类，增加reset，防止多股票之间持仓状态污染
 class GbdtWrapStrategy:
     """
@@ -153,19 +178,22 @@ class GbdtWrapStrategy:
                 self.in_position = False
                 return SignalEvent(bar.date, -1)
         return None
+
 def clear_all_cache():
     pattern = os.path.join(BASE_DIR, "cache_*.csv")
     cache_files = glob.glob(pattern)
     for f in cache_files:
         os.remove(f)
     logging.info(f"✅已清理行情缓存，共删除 {len(cache_files)} 个")
+
 def clean_all_output():
     patterns = [
         os.path.join(OUTPUT_DIR, "batch_*.png"),
         os.path.join(OUTPUT_DIR, "batch_*.csv"),
         os.path.join(OUTPUT_DIR, "batch_*.txt"),
         os.path.join(OUTPUT_DIR, "batch_batch_summary*.csv"),
-        os.path.join(OUTPUT_DIR, "batch_gbdt.log")
+        os.path.join(OUTPUT_DIR, "batch_gbdt.log"),
+        os.path.join(BASE_DIR, "images", "*feature_importance_*.png")
     ]
     cnt = 0
     for pat in patterns:
@@ -174,19 +202,6 @@ def clean_all_output():
             cnt += 1
     logger.info(f"🧹清理批量输出产物 {cnt} 个；行情cache缓存保留")
 
-def setup_logger():
-    log_path = os.path.join(OUTPUT_DIR, "batch_gbdt.log")
-    log_format = "%(asctime)s - %(levelname)s - %(message)s"
-    logging.basicConfig(
-        level=logging.INFO,
-        format=log_format,
-        handlers=[
-            logging.FileHandler(log_path, encoding="utf‑8"),
-            logging.StreamHandler()
-        ]
-    )
-    return logging.getLogger(__name__)
-logger = setup_logger()
 def ts_pro_bar_with_retry(code, adj, start_date, end_date, max_retry=MAX_RETRY):
     """
     tushare pro_bar接口带重试请求，处理限流、积分异常
@@ -228,7 +243,6 @@ def fetch_data(token: str, code: str, start: str, end: str, refresh_cache: bool 
     :param refresh_cache: bool True强制重新拉取不读缓存
     :return: pd.DataFrame 清洗完成的日线行情
     """
-
     if not token:
         token = os.getenv("TUSHARE_TOKEN", "").strip()
         if not token:
@@ -275,6 +289,52 @@ def fetch_data(token: str, code: str, start: str, end: str, refresh_cache: bool 
     if len(df) < 80:
         raise RuntimeError(f"{code}有效K线{len(df)}条，至少需要80条")
     return df
+
+def fetch_data_akshare(code: str, start: str, end: str, refresh_cache: bool = False) -> pd.DataFrame:
+    """
+    使用AKShare获取A股日线，免费无积分，输出格式对齐Tushare pro_bar
+    :param code: ts_code格式 "600519.SH"
+    :param start: YYYYMMDD
+    :param end: YYYYMMDD
+    :param refresh_cache: 是否强制刷新缓存
+    :return: 和tushare输出结构完全一致的DataFrame
+    """
+    import akshare as ak
+    cache_name = f"cache_ak_{code.replace('.', '_')}_{start}_{end}.csv"
+    cache_file = os.path.join(BASE_DIR, cache_name)
+    if not refresh_cache and os.path.exists(cache_file):
+        logger.info(f"读取AKShare本地缓存 {cache_file}")
+        df_raw = pd.read_csv(cache_file, encoding="utf‑8‑sig")
+        df_raw["trade_date"] = pd.to_datetime(df_raw["trade_date"].astype(str), format="%Y%m%d")
+    else:
+        sym, exchange = code.split(".")
+        ak_code = exchange.lower() + sym
+        logger.info(f"AKShare拉取行情 {ak_code}")
+        df_raw = ak.stock_zh_a_daily(symbol=ak_code, adjust="hfq")
+        df_raw = df_raw.rename(columns={
+            "date": "trade_date",
+            "open": "open",
+            "high": "high",
+            "low": "low",
+            "close": "close",
+            "volume": "vol"
+        })
+        df_raw["ts_code"] = code
+        df_raw["trade_date"] = pd.to_datetime(df_raw["trade_date"])
+        df_raw = df_raw.sort_values("trade_date").reset_index(drop=True)
+        df_raw_save = df_raw.copy()
+        df_raw_save["trade_date"] = df_raw_save["trade_date"].dt.strftime("%Y%m%d")
+        df_raw_save.to_csv(cache_file, index=False, encoding="utf‑8‑sig")
+    start_dt = pd.to_datetime(start, format="%Y%m%d")
+    end_dt = pd.to_datetime(end, format="%Y%m%d")
+    df = df_raw[(df_raw["trade_date"] >= start_dt) & (df_raw["trade_date"] <= end_dt)].copy()
+    df = df.dropna(subset=["open", "high", "low", "close", "vol"])
+    df = df.drop_duplicates(subset=["trade_date"], keep="last").reset_index(drop=True)
+    df = df.sort_values("trade_date").reset_index(drop=True)
+    if len(df) < 80:
+        raise RuntimeError(f"{code}有效K线{len(df)}条，至少需要80条")
+    return df
+
 def build_features(df: pd.DataFrame) -> pd.DataFrame:
     """
     根据原始日线计算全套技术因子与训练标签
@@ -282,7 +342,6 @@ def build_features(df: pd.DataFrame) -> pd.DataFrame:
     :param df: 原始日线DataFrame
     :return: 增加因子、label后的DataFrame
     """
-
     df = df.copy()
     df['ma5'] = df['close'].rolling(5).mean()
     df['ma20'] = df['close'].rolling(20).mean()
@@ -308,19 +367,21 @@ def build_features(df: pd.DataFrame) -> pd.DataFrame:
     # 注意：shift(-5)使用未来5日价格构造标签，仅离线回测可用；实盘不可获取未来数据（未来函数风险）
     df['label'] = (df['close'].shift(-5) > df['close']).astype(np.int64)
     return df
-def train_predict(df: pd.DataFrame, model_type: str, params: dict):
+
+def train_predict(df: pd.DataFrame, model_type: str, params: dict, stock_code: str, no_plot: bool):
     """
     时序划分数据集，TimeSeriesSplit时序交叉验证，训练lgb/xgb并输出涨跌概率
     :param df: 带特征与label的数据集
     :param model_type: str "lgb" / "xgb"
     :param params: dict 模型超参
+    :param stock_code: str 当前回测股票代码，用于特征重要性图片文件名
+    :param no_plot: bool 是否关闭全部绘图输出
     :return: df_out, cv_mean, cv_std, test_acc
         df_out:原始df新增prob_up/prob_down
         cv_mean:交叉验证平均acc
         cv_std:交叉验证标准差
         test_acc:测试集准确率
     """
-
     feature_cols = FEATURE_COLS
     split_idx = int(len(df) * TRAIN_RATIO)
     train_raw = df.iloc[:split_idx].copy()
@@ -336,7 +397,6 @@ def train_predict(df: pd.DataFrame, model_type: str, params: dict):
     y_train = train["label"]
     X_test = test[feature_cols]
     y_test = test["label"]
-    # 计算正负样本数量，用于XGBoost scale_pos_weight
     pos_cnt = int(np.sum(y_train == 1))
     neg_cnt = int(np.sum(y_train == 0))
     logger.info(f"训练集标签分布：正样本{pos_cnt},负样本{neg_cnt}")
@@ -349,13 +409,13 @@ def train_predict(df: pd.DataFrame, model_type: str, params: dict):
         if model_type == "lgb":
             fold_model = lgb.LGBMClassifier(**params)
         elif model_type == "xgb":
-            fold_params = {k:v for k,v in params.items() if k!="is_unbalance"}
+            fold_params = {k: v for k, v in params.items() if k != "is_unbalance"}
             fold_params["scale_pos_weight"] = scale_pos_weight_val
             fold_model = XGBClassifier(**fold_params)
         try:
             fold_model.fit(X_train.iloc[tr_idx], y_train.iloc[tr_idx])
         except Exception as e:
-            logger.error(f"fold{fold}训练异常：{str(e)}",exc_info=True)
+            logger.error(f"fold{fold}训练异常：{str(e)}", exc_info=True)
             raise RuntimeError(f"fold{fold}模型训练失败:{str(e)}")
         score = fold_model.score(X_train.iloc[va_idx], y_train.iloc[va_idx])
         cv_scores.append(score)
@@ -367,13 +427,41 @@ def train_predict(df: pd.DataFrame, model_type: str, params: dict):
         if model_type == "lgb":
             model = lgb.LGBMClassifier(**params)
         elif model_type == "xgb":
-            final_params = {k:v for k,v in params.items() if k!="is_unbalance"}
+            final_params = {k: v for k, v in params.items() if k != "is_unbalance"}
             final_params["scale_pos_weight"] = scale_pos_weight_val
             model = XGBClassifier(**final_params)
         model.fit(X_train, y_train)
     except Exception as e:
-        logger.error(f"主模型训练失败:{str(e)}",exc_info=True)
+        logger.error(f"主模型训练失败:{str(e)}", exc_info=True)
         raise RuntimeError(f"主模型训练异常:{str(e)}")
+
+    # ========== LGB / XGB 特征重要性绘图 ==========
+    if not no_plot:
+        img_save_dir = os.path.join(BASE_DIR, "images")
+        os.makedirs(img_save_dir, exist_ok=True)
+        feature_names = feature_cols
+        try:
+            importance = model.feature_importances_
+            imp_df = pd.DataFrame({
+                "feature": feature_names,
+                "importance": importance
+            }).sort_values("importance", ascending=True)
+            fig, ax = plt.subplots(figsize=(10, 7))
+            ax.barh(imp_df["feature"], imp_df["importance"])
+            if model_type == "lgb":
+                ax.set_title("LightGBM 特征重要性")
+            else:
+                ax.set_title("XGBoost 特征重要性")
+            ax.set_xlabel("重要性得分")
+            plt.tight_layout()
+            imp_img_path = os.path.join(img_save_dir, f"{model_type}_feature_importance_{stock_code.replace('.','_')}.png")
+            plt.savefig(imp_img_path, dpi=300, bbox_inches="tight")
+            plt.close()
+            logger.info(f"✅特征重要性图已保存 {imp_img_path}")
+        except Exception as imp_err:
+            logger.warning(f"⚠️特征重要性绘图跳过，err:{str(imp_err)}")
+    # =================================================
+
     y_pred_proba_full = model.predict_proba(X_test)
     y_pred_proba_up = y_pred_proba_full[:, 1]
     y_pred_proba_down = y_pred_proba_full[:, 0]
@@ -390,8 +478,8 @@ def train_predict(df: pd.DataFrame, model_type: str, params: dict):
 
 def run_single_stock(token, stock_code, start, end, initial_capital, no_plot,
                      model_type: str, model_params: dict,
-                     prob_threshold:float, sell_threshold:float,
-                     cluster_id: int, df_feat_arg=None):
+                     prob_threshold: float, sell_threshold: float,
+                     cluster_id: int, data_source: str, refresh_cache: bool, df_feat_arg=None):
     """
     单只股票完整回测流水线：拉取数据→因子计算→入库→模型训练→事件驱动回测→回测结果入库
     :param token: tushare token
@@ -405,18 +493,21 @@ def run_single_stock(token, stock_code, start, end, initial_capital, no_plot,
     :param prob_threshold:买入概率阈值
     :param sell_threshold:卖出概率阈值
     :param cluster_id:聚类编号，无聚类为-1
+    :param data_source:数据源 tushare / akshare
+    :param refresh_cache: bool 是否强制刷新行情缓存
     :param df_feat_arg: 传入预处理好的特征df，为批量聚类复用缓存；None则现场拉取计算
     :return: dict 单只股票回测结果汇总字典
     """
-
     stock_code = stock_code.upper()
     if df_feat_arg is None:
-        df_raw = fetch_data(token, stock_code, start, end)
+        if data_source == "tushare":
+            df_raw = fetch_data(token, stock_code, start, end, refresh_cache=refresh_cache)
+        elif data_source == "akshare":
+            df_raw = fetch_data_akshare(stock_code, start, end, refresh_cache=refresh_cache)
         df_feat = build_features(df_raw)
     else:
         df_raw = df_feat_arg.copy()
         df_feat = df_feat_arg
-
     # =========第一处：写入日线、因子，操作完立刻关闭连接=========
     db1 = StockDB()
     try:
@@ -432,7 +523,7 @@ def run_single_stock(token, stock_code, start, end, initial_capital, no_plot,
     finally:
         db1.close()
 
-    df_signal, cv_mean, cv_std, test_acc = train_predict(df_feat, model_type, model_params)
+    df_signal, cv_mean, cv_std, test_acc = train_predict(df_feat, model_type, model_params, stock_code, no_plot)
     df_backtest = df_signal.copy()
     strategy = GbdtWrapStrategy(df_backtest[["trade_date", "prob_up", "prob_down"]],
                                 prob_threshold=prob_threshold,
@@ -478,7 +569,7 @@ def run_single_stock(token, stock_code, start, end, initial_capital, no_plot,
     csv_name = os.path.join(OUTPUT_DIR, f"batch_report_{stock_code.replace('.', '_')}_{timestamp}.csv")
     df_signal.to_csv(csv_name, index=False, encoding="utf‑8‑sig")
     txt_name = os.path.join(OUTPUT_DIR, f"batch_summary_{stock_code.replace('.', '_')}_{timestamp}.txt")
-    with open(txt_name, "w", encoding="utf‑8") as f:
+    with open(txt_name, "w", encoding="utf-8") as f:
         f.write("⚠️本结果仅用于学习演示，不构成任何投资建议。历史回测不能代表未来收益。\n")
         f.write(f"脚本名称:batch_gbdt_event_strategy.py【批量GBDT事件驱动回测】\n")
         f.write(f"脚本版本:{__version__}\n")
@@ -541,8 +632,6 @@ def run_single_stock(token, stock_code, start, end, initial_capital, no_plot,
         "fail_reason": ""
     }
     out_dict["trade_cnt"] = len(trade_records)
-    logger.info(f"✅{stock_code} 完成回测 {out_dict}")
-
     # =========第二处：回测全部跑完，新建实例重新连接写回测结果=========
     db2 = StockDB()
     try:
@@ -579,17 +668,14 @@ def run_single_stock(token, stock_code, start, end, initial_capital, no_plot,
         logger.warning(traceback.format_exc())
     finally:
         db2.close()
-
     out_dict["trade_cnt"] = len(trade_records)
     logger.info(f"✅{stock_code} 完成回测 {out_dict}")
     return out_dict
 
-
 def main():
     """程序入口，解析命令行参数，执行批量股票回测逻辑"""
-
     parser = argparse.ArgumentParser(
-        description="批量GBDT事件驱动回测脚本，支持lgb/xgb切换；可选KMeans股票聚类实验，本代码仅学习演示，不构成投资建议"
+        description="批量GBDT事件驱动回测脚本，支持lgb/xgb切换；可选KMeans股票聚类实验，本代码仅学习演示，不构成任何投资建议"
     )
     parser.add_argument("--version", action="version", version=f"%(prog)s {__version__}")
     parser.add_argument("--codes", type=str, required=True, help="股票代码列表，逗号分割，例：600519.SH,000858.SZ")
@@ -598,14 +684,16 @@ def main():
     parser.add_argument("--token", type=str, default="", help="tushare token")
     parser.add_argument("--capital", type=float, default=None, help="每只股票回测初始资金；不填则手动输入，回车默认300000")
     parser.add_argument("--model", type=str, choices=["lgb", "xgb"], default="lgb", help="选择模型 lgb / xgb")
-    parser.add_argument("--prob-threshold",type=float,default=DEFAULT_PROB_THRESHOLD,help="买入上涨概率阈值")
-    parser.add_argument("--sell-threshold",type=float,default=DEFAULT_SELL_THRESHOLD,help="卖出下跌概率阈值")
+    parser.add_argument("--prob-threshold", type=float, default=DEFAULT_PROB_THRESHOLD, help="买入上涨概率阈值")
+    parser.add_argument("--sell-threshold", type=float, default=DEFAULT_SELL_THRESHOLD, help="卖出下跌概率阈值")
     parser.add_argument("--enable_cluster", action="store_true", help="开启KMeans股票聚类实验(仅训练集特征，防泄露)")
     parser.add_argument("--n_cluster", type=int, default=3, help="聚类簇数量，仅--enable_cluster生效")
     parser.add_argument("--refresh_cache", action="store_true", help="强制刷新行情缓存，重新拉取数据")
     parser.add_argument("--clear_cache", action="store_true", help="清空全部cache行情缓存")
     parser.add_argument("--clean_output", action="store_true", help="清理批量输出报告图片")
-    parser.add_argument("--no_plot", action="store_true", help="关闭绘图")
+    parser.add_argument("--no_plot", action="store_true", help="关闭全部绘图输出")
+    parser.add_argument("--data-source", type=str, choices=["tushare", "akshare"], default="tushare",
+                        help="行情数据源：tushare(需要积分，默认)；akshare免费无积分")
     args = parser.parse_args()
     if args.capital is None:
         input_str = input("请输入回测初始资金，直接回车使用默认值300000：").strip()
@@ -631,9 +719,9 @@ def main():
     for name, val in [("start", args.start), ("end", args.end)]:
         if not (val.isdigit() and len(val) == 8):
             raise RuntimeError(f"--{name}={val}格式错误，必须YYYYMMDD")
-    if not (0.0 <= args.prob_threshold <=1.0):
+    if not (0.0 <= args.prob_threshold <= 1.0):
         raise RuntimeError("--prob-threshold必须0~1之间")
-    if not (0.0 <= args.sell_threshold <=1.0):
+    if not (0.0 <= args.sell_threshold <= 1.0):
         raise RuntimeError("--sell-threshold必须0~1之间")
     shell_parts = ["python", "batch_gbdt_event_strategy.py"]
     shell_parts.extend(["--codes", args.codes])
@@ -642,8 +730,8 @@ def main():
         shell_parts.extend(["--token", args.token])
     shell_parts.extend(["--capital", str(initial_capital)])
     shell_parts.extend(["--model", args.model])
-    shell_parts.extend(["--prob-threshold",str(args.prob_threshold)])
-    shell_parts.extend(["--sell-threshold",str(args.sell_threshold)])
+    shell_parts.extend(["--prob-threshold", str(args.prob_threshold)])
+    shell_parts.extend(["--sell-threshold", str(args.sell_threshold)])
     if args.enable_cluster:
         shell_parts.append("--enable_cluster")
         shell_parts.extend(["--n_cluster", str(args.n_cluster)])
@@ -652,7 +740,7 @@ def main():
     if args.no_plot:
         shell_parts.append("--no_plot")
     run_cmd = safe_shell_join(shell_parts)
-    logger.info("========批量GBDT回测启动【v1.5.3 MySQL持久化】========")
+    logger.info("========批量GBDT回测启动【v1.5.5 MySQL全链路持久化｜双数据源】========")
     logger.info(f"脚本版本:{__version__}")
     logger.info(f"运行命令:{run_cmd}")
     logger.info(f"股票列表:{args.codes}")
@@ -675,7 +763,10 @@ def main():
             valid_stock_for_cluster = []
             for s_code in stock_list:
                 try:
-                    df_raw = fetch_data(args.token, s_code, args.start, args.end, refresh_cache=args.refresh_cache)
+                    if args.data_source == "tushare":
+                        df_raw = fetch_data(args.token, s_code, args.start, args.end, refresh_cache=args.refresh_cache)
+                    elif args.data_source == "akshare":
+                        df_raw = fetch_data_akshare(s_code, args.start, args.end, refresh_cache=args.refresh_cache)
                     df_feat = build_features(df_raw)
                     mem_df_cache[s_code] = df_feat
                     split_idx = int(len(df_feat) * TRAIN_RATIO)
@@ -725,6 +816,8 @@ def main():
                 prob_threshold=args.prob_threshold,
                 sell_threshold=args.sell_threshold,
                 cluster_id=cid,
+                data_source=args.data_source,
+                refresh_cache=args.refresh_cache,
                 df_feat_arg=df_feat_arg,
             )
             batch_result.append(res)
@@ -743,8 +836,8 @@ def main():
                 "stock_code": s_code,
                 "model_type": args.model,
                 "cluster_id": cid,
-                "prob_threshold":args.prob_threshold,
-                "sell_threshold":args.sell_threshold,
+                "prob_threshold": args.prob_threshold,
+                "sell_threshold": args.sell_threshold,
                 "cv_mean_acc": np.nan,
                 "cv_std_acc": np.nan,
                 "test_acc": np.nan,
@@ -762,6 +855,7 @@ def main():
     summary_df.to_csv(sum_csv, index=False, encoding="utf‑8‑sig")
     logger.info(f"\n✅全部批量任务结束，汇总报告输出 {sum_csv}")
     logger.info("\n" + summary_df.to_string())
+
 if __name__ == "__main__":
     try:
         main()

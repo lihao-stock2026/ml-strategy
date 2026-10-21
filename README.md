@@ -9,23 +9,44 @@
 
 ## 📊 回测效果可视化
 标的：600519.SH 贵州茅台，LGB事件驱动量化策略
-
 ### 1. 全周期净值对比（2020–2024）
 蓝色：LGB机器学习策略净值；橙色：买入持有基准
 ![全周期净值曲线](images/net_curve_full.png)
-
 > 说明：策略偏风控导向，在震荡下行阶段主动空仓，牺牲部分收益换取回撤控制，净值走势更加平稳。
-
 ### 2. 样本外净值、交易信号与模型特征重要性
 上图：样本外测试集策略净值与基准对比
 中图：K线叠加买卖信号，直观展示模型开仓、平仓时机
 下图：LightGBM特征重要性，解释模型依赖量价、均线、波动率因子生成信号
 ![信号与特征重要性图](images/model_signal_feature.png)
 
+## 🧪 批量多股票回测实验（LightGBM）
+> 实验目的：验证策略是否仅对单只标的（茅台）有效，排查单标的过拟合风险
+> 回测区间：2020‑01‑01 ~ 2024‑12‑31
+> 测试标的：600519.SH 贵州茅台、000858.SZ 五粮液
+> 配置：LightGBM模型，TimeSeriesSplit时序5折交叉验证，事件驱动严谨回测引擎
+
+### 多标的回测指标对比
+| stock_code | model_type | cv_mean_acc | test_acc | total_return |
+| ---- | ---- | ---- | ---- | ---- |
+| 600519.SH | lgb | 0.5253 | 0.4938 | -0.2423 |
+| 000858.SZ | lgb | 0.5329 | 0.5556 | -0.2109 |
+
+### 📝实验结论
+1. 两只标的的样本外预测准确率仅略高于50%随机水平，技术因子对涨跌的预测能力偏弱；
+2. 在2020‑2024震荡下行行情中，两只股票回测总收益均为负，说明**策略存在较强的行情环境依赖性，熊市、震荡市容易失效**；
+3. 五粮液样本外准确率略高于茅台，但依旧无法实现正向收益；证明策略不是单纯拟合茅台单只股票，但整体盈利能力仍存在明显短板；
+4. 后续迭代优化方向：改进涨跌标签逻辑、增加事件驱动内核止损风控、扩充因子特征库、超参数网格搜索调参。
+
+### 多标的特征重要性
+![茅台 LightGBM特征重要性](./images/lgb_feature_importance_600519_SH.png)
+![五粮液 LightGBM特征重要性](./images/lgb_feature_importance_000858_SZ.png)
+
+
 ## 项目文件结构
 ```
 ├── event_backtest.py           # 事件驱动底层回测内核，双均线策略示例
 ├── batch_gbdt_event_strategy.py# 批量多股票 GBDT (LGB/XGB) + 事件驱动回测
+├── analyze_batch_result.py     # 批量回测结果分析脚本，读取汇总 csv，生成 Markdown 对比表格
 ├── ml_strategy.py              # 随机森林向量化快速回测（粗筛工具）
 ├── db_utils.py                 # MySQL 数据库读写工具类
 ├── load_stock_basic.py         # 股票基础信息初始化脚本
@@ -37,14 +58,15 @@
 └── images/                     # README 展示图片，提交到仓库
 ```
 
-
 ### 文件说明
 - `event_backtest.py`：事件驱动回测内核，模拟真实下单、成交、持仓逻辑；支持单只标的回测。
-- `batch_gbdt_event_strategy.py`：批量回测脚本，调用事件驱动内核，支持LGB、XGBoost模型；支持K‑Means股票聚类实验。
+- `batch_gbdt_event_strategy.py`：批量回测脚本，调用事件驱动内核，支持LGB、XGBoost模型；支持K‑Means股票聚类实验，支持Tushare / AKShare双数据源切换。
+- `analyze_batch_result.py`：批量回测后分析工具，读取output目录下批量汇总csv，自动生成Markdown格式指标对比表格，方便写入项目文档。
 - `ml_strategy.py`：向量化快速回测，**不模拟A股100手最小交易单位**，仅用于快速实验；严谨评估请使用事件驱动版本。
 - `db_utils.py`：MySQL数据库工具类，封装所有表的插入、查询操作；解决`np.nan`入库报错，处理事务提交、回滚、连接安全关闭，规避MySQL空闲断开问题。
 - `load_stock_basic.py`：手动写入股票基础信息，绕过Tushare stock_basic接口限流。
 - `init_db.sql`：MySQL数据库建表语句，包含行情、因子、回测结果全套表结构。
+
 
 ## 环境准备
 ### 1. Python版本
