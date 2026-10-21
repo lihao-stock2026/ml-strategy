@@ -43,6 +43,8 @@ from event_backtest import (
     Event, MarketEvent, SignalEvent, OrderEvent, FillEvent,
     calc_metrics, DataHandler
 )
+import logging
+logger = logging.getLogger(__name__)
 from db_utils import StockDB
 __version__ = "1.5.3"
 MAX_BATCH_STOCKS = 20
@@ -70,21 +72,22 @@ except Exception:
     import matplotlib
     matplotlib.use('Agg')
 import matplotlib.pyplot as plt
-plt.rcParams["font.sans-serif"] = ["SimHei"]
-plt.rcParams["axes.unicode_minus"] = False # 解决负号显示问题
 load_dotenv()
-plt.rcParams['font.sans-serif'] = ['SimHei', 'Microsoft YaHei', 'Arial Unicode MS']
-plt.rcParams['axes.unicode_minus'] = False
+# 多操作系统兼容中文字体：Windows / MacOS / Linux
+plt.rcParams["font.sans-serif"] = ["SimHei", "Microsoft YaHei", "Arial Unicode MS", "WenQuanYi Micro Hei", "Heiti TC"]
+plt.rcParams["axes.unicode_minus"] = False
+
 if importlib is not None:
     try:
         tushare_ver = importlib.metadata.version("tushare")
         ver_major, ver_minor, ver_patch = map(int, tushare_ver.split(".")[:3])
         if (ver_major, ver_minor, ver_patch) < (1, 2, 89):
-            print(f"⚠️警告：检测到tushare版本 {tushare_ver} 过低，建议执行：pip install tushare --upgrade")
+            logger.warning(f"⚠️警告：检测到tushare版本 {tushare_ver} 过低，建议执行：pip install tushare --upgrade")
     except Exception:
-        print("⚠️警告：无法获取tushare版本，请确认tushare>=1.2.89已正确安装")
+        logger.warning("⚠️警告：无法获取tushare版本，请确认tushare>=1.2.89已正确安装")
 else:
-    print("⚠️当前Python版本较低，跳过tushare版本检测，请手动确认tushare>=1.2.89")
+    logger.warning("⚠️当前Python版本较低，跳过tushare版本检测，请手动确认tushare>=1.2.89")
+
 RISK_FREE_RATE = 0.02
 COST_RATE = 0.0003
 STAMP_TAX = 0.001
@@ -110,15 +113,29 @@ FEATURE_COLS = [
 ]
 # 全局策略类，增加reset，防止多股票之间持仓状态污染
 class GbdtWrapStrategy:
+    """
+    GBDT机器学习信号封装策略类
+    根据模型输出上涨/下跌概率生成交易SignalEvent
+    :param signal_df: DataFrame，包含trade_date, prob_up, prob_down
+    :param prob_threshold: float，买入上涨概率阈值
+    :param sell_threshold: float，卖出下跌概率阈值
+    """
     def __init__(self, signal_df, prob_threshold, sell_threshold):
         self.df = signal_df.set_index("trade_date")
         self.in_position = False
         self.prob_threshold = prob_threshold
         self.sell_threshold = sell_threshold
+
     def reset(self):
         """每只股票回测前调用，重置持仓状态，避免多股票状态互相污染"""
         self.in_position = False
+
     def calculate_signal(self, bar: MarketEvent):
+        """
+        根据单根K线MarketEvent计算交易信号
+        :param bar: MarketEvent 对象，当日行情bar
+        :return: SignalEvent | None，有信号返回对象，无信号返回None
+        """
         if bar.date not in self.df.index:
             return None
         p_up = self.df.loc[bar.date, "prob_up"]
@@ -155,7 +172,8 @@ def clean_all_output():
         for f in glob.glob(pat):
             os.remove(f)
             cnt += 1
-    print(f"🧹清理批量输出产物 {cnt} 个；行情cache缓存保留")
+    logger.info(f"🧹清理批量输出产物 {cnt} 个；行情cache缓存保留")
+
 def setup_logger():
     log_path = os.path.join(OUTPUT_DIR, "batch_gbdt.log")
     log_format = "%(asctime)s - %(levelname)s - %(message)s"
@@ -170,6 +188,15 @@ def setup_logger():
     return logging.getLogger(__name__)
 logger = setup_logger()
 def ts_pro_bar_with_retry(code, adj, start_date, end_date, max_retry=MAX_RETRY):
+    """
+    tushare pro_bar接口带重试请求，处理限流、积分异常
+    :param code: str ts_code股票代码
+    :param adj: str 复权模式 hfq/qfq
+    :param start_date: str YYYYMMDD
+    :param end_date: str YYYYMMDD
+    :param max_retry: int 最大重试次数
+    :return: pd.DataFrame | None 行情DataFrame，空则返回None
+    """
     for attempt in range(max_retry):
         try:
             time.sleep(API_MIN_INTERVAL)
@@ -190,7 +217,18 @@ def ts_pro_bar_with_retry(code, adj, start_date, end_date, max_retry=MAX_RETRY):
             else:
                 logger.warning(f"Tushare请求失败，重试 {attempt + 1}/{max_retry}, err:{err_msg}")
     raise RuntimeError("Tushare多次请求失败")
+
 def fetch_data(token: str, code: str, start: str, end: str, refresh_cache: bool = False) -> pd.DataFrame:
+    """
+    获取单只股票行情，优先读取本地cache，无缓存则调用tushare接口
+    :param token: tushare token
+    :param code: 股票ts_code
+    :param start: YYYYMMDD 起始时间
+    :param end: YYYYMMDD 结束时间
+    :param refresh_cache: bool True强制重新拉取不读缓存
+    :return: pd.DataFrame 清洗完成的日线行情
+    """
+
     if not token:
         token = os.getenv("TUSHARE_TOKEN", "").strip()
         if not token:
@@ -238,6 +276,13 @@ def fetch_data(token: str, code: str, start: str, end: str, refresh_cache: bool 
         raise RuntimeError(f"{code}有效K线{len(df)}条，至少需要80条")
     return df
 def build_features(df: pd.DataFrame) -> pd.DataFrame:
+    """
+    根据原始日线计算全套技术因子与训练标签
+    注意：label使用shift(-5)未来5日数据，仅离线回测使用，实盘禁止使用该标签
+    :param df: 原始日线DataFrame
+    :return: 增加因子、label后的DataFrame
+    """
+
     df = df.copy()
     df['ma5'] = df['close'].rolling(5).mean()
     df['ma20'] = df['close'].rolling(20).mean()
@@ -264,6 +309,18 @@ def build_features(df: pd.DataFrame) -> pd.DataFrame:
     df['label'] = (df['close'].shift(-5) > df['close']).astype(np.int64)
     return df
 def train_predict(df: pd.DataFrame, model_type: str, params: dict):
+    """
+    时序划分数据集，TimeSeriesSplit时序交叉验证，训练lgb/xgb并输出涨跌概率
+    :param df: 带特征与label的数据集
+    :param model_type: str "lgb" / "xgb"
+    :param params: dict 模型超参
+    :return: df_out, cv_mean, cv_std, test_acc
+        df_out:原始df新增prob_up/prob_down
+        cv_mean:交叉验证平均acc
+        cv_std:交叉验证标准差
+        test_acc:测试集准确率
+    """
+
     feature_cols = FEATURE_COLS
     split_idx = int(len(df) * TRAIN_RATIO)
     train_raw = df.iloc[:split_idx].copy()
@@ -335,6 +392,23 @@ def run_single_stock(token, stock_code, start, end, initial_capital, no_plot,
                      model_type: str, model_params: dict,
                      prob_threshold:float, sell_threshold:float,
                      cluster_id: int, df_feat_arg=None):
+    """
+    单只股票完整回测流水线：拉取数据→因子计算→入库→模型训练→事件驱动回测→回测结果入库
+    :param token: tushare token
+    :param stock_code: 股票代码
+    :param start: YYYYMMDD
+    :param end: YYYYMMDD
+    :param initial_capital: 初始回测资金
+    :param no_plot: bool 是否关闭绘图
+    :param model_type: lgb/xgb
+    :param model_params: 模型参数字典
+    :param prob_threshold:买入概率阈值
+    :param sell_threshold:卖出概率阈值
+    :param cluster_id:聚类编号，无聚类为-1
+    :param df_feat_arg: 传入预处理好的特征df，为批量聚类复用缓存；None则现场拉取计算
+    :return: dict 单只股票回测结果汇总字典
+    """
+
     stock_code = stock_code.upper()
     if df_feat_arg is None:
         df_raw = fetch_data(token, stock_code, start, end)
@@ -512,6 +586,8 @@ def run_single_stock(token, stock_code, start, end, initial_capital, no_plot,
 
 
 def main():
+    """程序入口，解析命令行参数，执行批量股票回测逻辑"""
+
     parser = argparse.ArgumentParser(
         description="批量GBDT事件驱动回测脚本，支持lgb/xgb切换；可选KMeans股票聚类实验，本代码仅学习演示，不构成投资建议"
     )
@@ -539,7 +615,7 @@ def main():
             try:
                 initial_capital = float(input_str)
             except ValueError:
-                print("输入格式错误，将使用默认300000")
+                logger.warning("输入格式错误，将使用默认300000")
                 initial_capital = 300000.0
     else:
         initial_capital = args.capital
