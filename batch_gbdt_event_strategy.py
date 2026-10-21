@@ -51,22 +51,31 @@ from event_backtest import (
     calc_metrics, DataHandler
 )
 from db_utils import StockDB
+
 __version__ = "1.5.5"
 MAX_BATCH_STOCKS = 20
 API_MIN_INTERVAL = 0.4
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 OUTPUT_DIR = os.path.join(BASE_DIR, "output")
 os.makedirs(OUTPUT_DIR, exist_ok=True)
-# 全局随机种子，保证可复现
+
+# 全局随机种子，保证实验可复现
 SEED = 42
 np.random.seed(SEED)
 random.seed(SEED)
 
+
 def safe_shell_join(args_list):
+    """
+    跨平台安全拼接shell命令参数
+    :param args_list: list[str] 命令参数列表
+    :return: str 拼接后的命令字符串
+    """
     try:
         return shlex.join(args_list)
     except AttributeError:
         return " ".join(shlex.quote(x) for x in args_list)
+
 
 try:
     import importlib.metadata
@@ -82,11 +91,17 @@ except Exception:
 import matplotlib.pyplot as plt
 
 load_dotenv()
+
 # 多操作系统兼容中文字体：Windows / MacOS / Linux
 plt.rcParams["font.sans-serif"] = ["SimHei", "Microsoft YaHei", "Arial Unicode MS", "WenQuanYi Micro Hei", "Heiti TC"]
 plt.rcParams["axes.unicode_minus"] = False
 
+
 def setup_logger():
+    """
+    初始化日志对象，同时输出到控制台与本地日志文件batch_gbdt.log
+    :return: logging.Logger 配置完成的logger实例
+    """
     log_path = os.path.join(OUTPUT_DIR, "batch_gbdt.log")
     log_format = "%(asctime)s - %(levelname)s - %(message)s"
     logging.basicConfig(
@@ -98,6 +113,7 @@ def setup_logger():
         ]
     )
     return logging.getLogger(__name__)
+
 
 logger = setup_logger()
 
@@ -112,6 +128,7 @@ if importlib is not None:
 else:
     logger.warning("⚠️当前Python版本较低，跳过tushare版本检测，请手动确认tushare>=1.2.89")
 
+# --------------------------全局业务常量，全部收拢在此处--------------------------
 RISK_FREE_RATE = 0.02
 COST_RATE = 0.0003
 STAMP_TAX = 0.001
@@ -119,7 +136,7 @@ SLIPPAGE = 0.0005
 MAX_RETRY = 3
 ADJ_MODE = "hfq"
 TRAIN_RATIO = 0.8
-# 默认阈值，可命令行覆盖
+# 默认阈值，可通过命令行参数覆盖
 DEFAULT_PROB_THRESHOLD = 0.35
 DEFAULT_SELL_THRESHOLD = 0.45
 DEFAULT_PARAMS = {
@@ -135,8 +152,9 @@ FEATURE_COLS = [
     'vol_change', 'vol_ratio',
     'ret_1d', 'ret_5d', 'ret_10d', 'volatility'
 ]
+# --------------------------------------------------------------------------------
 
-# 全局策略类，增加reset，防止多股票之间持仓状态污染
+
 class GbdtWrapStrategy:
     """
     GBDT机器学习信号封装策略类
@@ -179,14 +197,18 @@ class GbdtWrapStrategy:
                 return SignalEvent(bar.date, -1)
         return None
 
+
 def clear_all_cache():
+    """清除本地所有cache_*.csv行情缓存文件"""
     pattern = os.path.join(BASE_DIR, "cache_*.csv")
     cache_files = glob.glob(pattern)
     for f in cache_files:
         os.remove(f)
     logging.info(f"✅已清理行情缓存，共删除 {len(cache_files)} 个")
 
+
 def clean_all_output():
+    """清理批量回测输出产物：图片、csv、txt、日志，保留行情cache缓存"""
     patterns = [
         os.path.join(OUTPUT_DIR, "batch_*.png"),
         os.path.join(OUTPUT_DIR, "batch_*.csv"),
@@ -201,6 +223,7 @@ def clean_all_output():
             os.remove(f)
             cnt += 1
     logger.info(f"🧹清理批量输出产物 {cnt} 个；行情cache缓存保留")
+
 
 def ts_pro_bar_with_retry(code, adj, start_date, end_date, max_retry=MAX_RETRY):
     """
@@ -232,6 +255,7 @@ def ts_pro_bar_with_retry(code, adj, start_date, end_date, max_retry=MAX_RETRY):
             else:
                 logger.warning(f"Tushare请求失败，重试 {attempt + 1}/{max_retry}, err:{err_msg}")
     raise RuntimeError("Tushare多次请求失败")
+
 
 def fetch_data(token: str, code: str, start: str, end: str, refresh_cache: bool = False) -> pd.DataFrame:
     """
@@ -290,6 +314,7 @@ def fetch_data(token: str, code: str, start: str, end: str, refresh_cache: bool 
         raise RuntimeError(f"{code}有效K线{len(df)}条，至少需要80条")
     return df
 
+
 def fetch_data_akshare(code: str, start: str, end: str, refresh_cache: bool = False) -> pd.DataFrame:
     """
     使用AKShare获取A股日线，免费无积分，输出格式对齐Tushare pro_bar
@@ -335,6 +360,7 @@ def fetch_data_akshare(code: str, start: str, end: str, refresh_cache: bool = Fa
         raise RuntimeError(f"{code}有效K线{len(df)}条，至少需要80条")
     return df
 
+
 def build_features(df: pd.DataFrame) -> pd.DataFrame:
     """
     根据原始日线计算全套技术因子与训练标签
@@ -370,6 +396,21 @@ def build_features(df: pd.DataFrame) -> pd.DataFrame:
     # 样本分布相对均衡，适合网格搜索观察过拟合；仅离线回测，存在未来函数风险
     # ----------------------
     df['label'] = (df['close'].shift(-5) > df['close']).astype(np.int64)
+
+    # ----------------------
+    # 【备选实验标签，已注释】未来5日区间最大涨幅大于3%标记上涨样本
+    # 该标签会造成正样本数量极少，模型输出prob_up普遍偏低，极易出现零交易；仅用于对比实验
+    # ----------------------
+    # def calc_future_max_high(series, window=5):
+    #     out = np.full(len(series), np.nan)
+    #     for i in range(len(series) - window):
+    #         out[i] = series.iloc[i:i + window].max()
+    #     return out
+    # df['future_high_5'] = calc_future_max_high(df['high'], window=5)
+    # df['future_return_5'] = df['future_high_5'] / df['close'] - 1
+    # df['label'] = (df['future_return_5'] > 0.03).astype(np.int64)
+    # df.drop(columns=["future_high_5", "future_return_5"], inplace=True)
+
     return df
 
 
@@ -474,12 +515,14 @@ def train_predict(df: pd.DataFrame, model_type: str, params: dict, stock_code: s
     acc = accuracy_score(y_test, y_pred_cls)
     logger.info(f"测试集acc:{acc:.4f}")
     logger.info("\n" + classification_report(y_test, y_pred_cls, zero_division=0))
+
     test = test.copy()
     test["prob_up"] = y_pred_proba_up
     test["prob_down"] = y_pred_proba_down
     df_out = df.copy()
     df_out = df_out.merge(test[["trade_date", "prob_up", "prob_down"]], how="left", on="trade_date")
     return df_out, cv_mean, cv_std, acc
+
 
 def run_single_stock(token, stock_code, start, end, initial_capital, no_plot,
                      model_type: str, model_params: dict,
@@ -513,6 +556,7 @@ def run_single_stock(token, stock_code, start, end, initial_capital, no_plot,
     else:
         df_raw = df_feat_arg.copy()
         df_feat = df_feat_arg
+
     # =========第一处：写入日线、因子，操作完立刻关闭连接=========
     db1 = StockDB()
     try:
@@ -606,7 +650,6 @@ def run_single_stock(token, stock_code, start, end, initial_capital, no_plot,
                 how="inner"
             )
             logger.info(f"合并后绘图数据集行数 {len(plot_df)}, base_price={base_price:.2f}")
-            logger.info(plot_df.head(5))
             ax.plot(plot_df["trade_date"], plot_df["net_series"], label=f"{model_type}策略", lw=1.4)
             ax.plot(plot_df["trade_date"], plot_df["bh_net"], label="买入持有", alpha=0.7)
             ax.set_title(f"{stock_code} {model_type}-事件驱动回测净值 | cluster_id={cluster_id}")
@@ -676,6 +719,7 @@ def run_single_stock(token, stock_code, start, end, initial_capital, no_plot,
     out_dict["trade_cnt"] = len(trade_records)
     logger.info(f"✅{stock_code} 完成回测 {out_dict}")
     return out_dict
+
 
 def main():
     """程序入口，解析命令行参数，执行批量股票回测逻辑"""
@@ -860,6 +904,7 @@ def main():
     summary_df.to_csv(sum_csv, index=False, encoding="utf‑8‑sig")
     logger.info(f"\n✅全部批量任务结束，汇总报告输出 {sum_csv}")
     logger.info("\n" + summary_df.to_string())
+
 
 if __name__ == "__main__":
     try:

@@ -4,16 +4,26 @@ MySQL数据库工具类，用于量化项目读写数据
 彻底修复np.nan/numpy类型批量插入回滚；连接泄露；空闲超时gone‑away问题
 """
 import os
+import logging
 import pymysql
 import pandas as pd
 from dotenv import load_dotenv
 from pymysql.err import OperationalError, MySQLError
 
 load_dotenv()
+# 模块独立日志器，不和外部logger耦合
+logger = logging.getLogger(__name__)
+logger.setLevel(logging.INFO)
+if not logger.handlers:
+    stream_handler = logging.StreamHandler()
+    fmt = logging.Formatter("%(asctime)s - %(levelname)s - %(message)s")
+    stream_handler.setFormatter(fmt)
+    logger.addHandler(stream_handler)
 
 
 class StockDB:
     def __init__(self):
+        """初始化数据库配置，从.env读取连接参数，不建立实际连接"""
         self.host = os.getenv("DB_HOST")
         self.port = os.getenv("DB_PORT")
         self.user = os.getenv("DB_USER")
@@ -23,7 +33,10 @@ class StockDB:
         self.cursor = None
 
     def connect(self):
-        """建立数据库连接，使用普通cursor，适配executemany批量插入"""
+        """
+        建立数据库连接，使用普通cursor，适配executemany批量插入
+        :return: bool True连接成功，False连接失败
+        """
         try:
             self.conn = pymysql.connect(
                 host=self.host,
@@ -34,24 +47,29 @@ class StockDB:
                 charset="utf8mb4"
             )
             self.cursor = self.conn.cursor()
-            print("✅ MySQL连接成功")
+            logger.info("✅ MySQL连接成功")
             return True
         except OperationalError as e:
-            print(f"❌ MySQL连接失败: {e}")
+            logger.error(f"❌ MySQL连接失败: {e}")
             return False
 
     def close(self):
-        """安全关闭游标与连接"""
+        """安全关闭游标与数据库连接，避免数据库连接泄露"""
         if self.cursor:
             self.cursor.close()
             self.cursor = None
         if self.conn:
             self.conn.close()
             self.conn = None
-            print("🔌 数据库连接已关闭")
+            logger.info("🔌 数据库连接已关闭")
 
     @staticmethod
     def _convert_datetime_to_str(df: pd.DataFrame):
+        """
+        数据预处理：datetime转字符串，np.nan/pd.NA转换为MySQL可识别的None
+        :param df: 待写入DataFrame
+        :return: pd.DataFrame 处理完成副本
+        """
         df = df.copy()
         if "trade_date" in df.columns:
             df["trade_date"] = pd.to_datetime(df["trade_date"]).dt.strftime("%Y-%m-%d")
@@ -63,8 +81,13 @@ class StockDB:
         return df
 
     def insert_stock_basic(self, df: pd.DataFrame):
+        """
+        批量写入股票基础信息表，主键冲突执行ON DUPLICATE KEY UPDATE更新
+        :param df: 股票基础信息DataFrame
+        :raises RuntimeError: mysql写入异常，已执行回滚
+        """
         if df.empty:
-            print("ℹ️ stock_basic 数据集为空，跳过写入")
+            logger.info("ℹ️ stock_basic 数据集为空，跳过写入")
             return
         df = self._convert_datetime_to_str(df)
         sql = """
@@ -77,16 +100,21 @@ class StockDB:
         try:
             self.cursor.executemany(sql, data_list)
             self.conn.commit()
-            print(f"📥 写入 {len(data_list)} 条股票基础信息")
+            logger.info(f"📥 写入 {len(data_list)} 条股票基础信息")
         except MySQLError as e:
             self.conn.rollback()
             err_msg = f"❌写入stock_basic异常，已回滚: {str(e)}"
-            print(err_msg)
+            logger.error(err_msg)
             raise RuntimeError(err_msg) from e
 
     def insert_stock_daily(self, df: pd.DataFrame):
+        """
+        批量写入日线行情表，主键冲突执行更新
+        :param df: 日线行情DataFrame
+        :raises RuntimeError: mysql写入异常，已执行回滚
+        """
         if df.empty:
-            print("ℹ️ stock_daily 数据集为空，跳过写入")
+            logger.info("ℹ️ stock_daily 数据集为空，跳过写入")
             return
         df = self._convert_datetime_to_str(df)
         sql = """
@@ -100,16 +128,21 @@ class StockDB:
         try:
             self.cursor.executemany(sql, data_list)
             self.conn.commit()
-            print(f"📥 写入 {len(data_list)} 条日线行情")
+            logger.info(f"📥 写入 {len(data_list)} 条日线行情")
         except MySQLError as e:
             self.conn.rollback()
             err_msg = f"❌写入stock_daily异常，已回滚: {str(e)}"
-            print(err_msg)
+            logger.error(err_msg)
             raise RuntimeError(err_msg) from e
 
     def insert_stock_factor(self, df: pd.DataFrame):
+        """
+        批量写入技术因子表；自动把np.nan转为None，防止入库报错回滚
+        :param df: 技术因子DataFrame
+        :raises RuntimeError: mysql写入异常，已执行回滚
+        """
         if df.empty:
-            print("📢 stock_factor 数据集为空，跳过写入")
+            logger.info("📢 stock_factor 数据集为空，跳过写入")
             return
         df = self._convert_datetime_to_str(df)
         sql = """
@@ -144,16 +177,21 @@ class StockDB:
         try:
             self.cursor.executemany(sql, data_list)
             self.conn.commit()
-            print(f"📥 写入 {len(data_list)} 条因子数据")
+            logger.info(f"📥 写入 {len(data_list)} 条因子数据")
         except MySQLError as e:
             self.conn.rollback()
             err_msg = f"❌写入stock_factor异常，已回滚: {str(e)}"
-            print(err_msg)
+            logger.error(err_msg)
             raise RuntimeError(err_msg) from e
 
     def insert_backtest_trade(self, df: pd.DataFrame):
+        """
+        批量写入回测交易记录表
+        :param df: 交易记录DataFrame
+        :raises RuntimeError: mysql写入异常，已执行回滚
+        """
         if df.empty:
-            print("ℹ️ backtest_trade 交易记录数据集为空，跳过写入")
+            logger.info("ℹ️ backtest_trade 交易记录数据集为空，跳过写入")
             return
         df = self._convert_datetime_to_str(df)
         sql = """
@@ -167,14 +205,19 @@ class StockDB:
         try:
             self.cursor.executemany(sql, data_list)
             self.conn.commit()
-            print(f"📥 写入 {len(data_list)} 条交易记录")
+            logger.info(f"📥 写入 {len(data_list)} 条交易记录")
         except MySQLError as e:
             self.conn.rollback()
             err_msg = f"❌写入backtest_trade异常，已回滚: {str(e)}"
-            print(err_msg)
+            logger.error(err_msg)
             raise RuntimeError(err_msg) from e
 
     def insert_backtest_summary(self, data_dict: dict):
+        """
+        写入回测汇总指标单条记录
+        :param data_dict: 回测汇总指标字典
+        :raises RuntimeError: mysql写入异常，已执行回滚
+        """
         sql = """
         INSERT INTO backtest_summary
         (strategy_name, start_date, end_date, initial_capital, final_capital, total_return, sharpe_ratio, max_drawdown, win_rate)
@@ -196,14 +239,21 @@ class StockDB:
                 data_dict["win_rate"]
             ))
             self.conn.commit()
-            print("📥 写入回测汇总指标")
+            logger.info("📥 写入回测汇总指标")
         except MySQLError as e:
             self.conn.rollback()
             err_msg = f"❌写入backtest_summary异常，已回滚: {str(e)}"
-            print(err_msg)
+            logger.error(err_msg)
             raise RuntimeError(err_msg) from e
 
     def query_daily_data(self, ts_code: str, start_date: str, end_date: str) -> pd.DataFrame:
+        """
+        根据股票代码+时间范围，查询日线行情
+        :param ts_code: 股票ts代码
+        :param start_date: 开始日期 YYYY‑MM‑DD
+        :param end_date: 结束日期 YYYY‑MM‑DD
+        :return: pd.DataFrame 查询结果，无数据返回空DataFrame
+        """
         sql = """
         SELECT trade_date, open, high, low, close, vol
         FROM stock_daily
@@ -216,15 +266,15 @@ class StockDB:
             res = self.cursor.fetchall()
             df = pd.DataFrame(res, columns=cols)
             if df.empty:
-                print(f"ℹ️ query_daily_data: {ts_code} 在[{start_date}~{end_date}]未查询到行情数据")
+                logger.info(f"ℹ️ query_daily_data: {ts_code} 在[{start_date}~{end_date}]未查询到行情数据")
             return df
         except MySQLError as e:
-            print(f"❌查询日线数据异常:{e}")
+            logger.error(f"❌查询日线数据异常:{e}")
             return pd.DataFrame(columns=cols)
 
 
 if __name__ == "__main__":
     db = StockDB()
     if db.connect():
-        print("数据库工具测试成功！")
+        logger.info("数据库工具测试成功！")
     db.close()

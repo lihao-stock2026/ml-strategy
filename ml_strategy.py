@@ -3,30 +3,25 @@
 利用历史K线、均线、MACD、RSI、成交量等技术特征
 使用随机森林分类器预测股票次日涨跌，生成机器学习交易策略
 与买入持有策略做回测对比
-
 ⚠️重要说明：
 本向量化回测为快速粗筛工具，**未模拟A股100股最小交易单位**；严谨回测评估请使用event_backtest.py事件驱动模块。
 标签使用shift(-1)获取未来价格，属于离线回测未来函数；实盘需要滚动窗口重新训练，不可直接拿未来行情。
-
 更新v1.0.5：
 1.增加ret_1d空值防护，防止净值全部NaN
 2.注释标明向量化版本不模拟A股1手规则
 3.全局统一随机种子，和项目其他脚本对齐
 4.全部输出定向output文件夹
 5.加固边界与异常捕获
-
-依赖库：
-    tushare>=1.2.89, pandas, numpy, scikit‑learn, matplotlib, python‑dotenv
 ⚠️风险免责：本代码仅用于学习演示，不构成任何投资建议。历史回测结果不能代表未来实际收益。
 """
 import os
 import glob
-import logging
-from logging.handlers import RotatingFileHandler
 import argparse
 import time
 import shlex
 import random
+import logging
+from logging.handlers import RotatingFileHandler
 from datetime import datetime
 from dotenv import load_dotenv
 import tushare as ts
@@ -44,11 +39,18 @@ SEED = 42
 np.random.seed(SEED)
 random.seed(SEED)
 
+
 def safe_shell_join(args_list):
+    """
+    跨平台安全拼接shell命令参数
+    :param args_list: list[str] 命令参数列表
+    :return: str 拼接后的命令字符串
+    """
     try:
         return shlex.join(args_list)
     except AttributeError:
         return " ".join(shlex.quote(x) for x in args_list)
+
 
 try:
     import importlib.metadata
@@ -63,6 +65,7 @@ except Exception:
     matplotlib.use('Agg')
 import matplotlib.pyplot as plt
 import matplotlib.dates as mdates
+
 
 load_dotenv()
 OUTPUT_DIR = "./output"
@@ -98,13 +101,17 @@ FEATURE_COLS = [
     'ret_1d', 'ret_5d', 'ret_10d', 'volatility'
 ]
 
+
 def clear_all_cache():
+    """清除本地所有cache_*.csv行情缓存文件"""
     cache_files = glob.glob("cache_*.csv")
     for f in cache_files:
         os.remove(f)
     logging.info(f"✅已清理行情缓存，共删除 {len(cache_files)} 个")
 
+
 def clean_all_output():
+    """清理向量化回测输出产物，保留行情cache缓存"""
     patterns = [
         os.path.join(OUTPUT_DIR, "ml_*.png"),
         os.path.join(OUTPUT_DIR, "ml_*.csv"),
@@ -118,7 +125,12 @@ def clean_all_output():
             cnt += 1
     print(f"🧹已清理输出报告/图片/日志，共删除 {cnt} 个；行情cache缓存已保留")
 
+
 def setup_logger():
+    """
+    初始化日志对象，文件滚动保存，同时输出控制台
+    :return: logging.Logger 日志实例
+    """
     log_path = os.path.join(OUTPUT_DIR, "ml_backtest.log")
     log_format = "%(asctime)s - %(levelname)s - %(message)s"
     logger = logging.getLogger()
@@ -133,9 +145,20 @@ def setup_logger():
     logger.addHandler(console_handler)
     return logger
 
+
 logger = setup_logger()
 
+
 def ts_pro_bar_with_retry(code, adj, start_date, end_date, max_retry=MAX_RETRY):
+    """
+    tushare pro_bar接口带重试请求，处理限流、积分异常
+    :param code: str ts_code股票代码
+    :param adj: str 复权模式 hfq/qfq
+    :param start_date: str YYYYMMDD
+    :param end_date: str YYYYMMDD
+    :param max_retry: int 最大重试次数
+    :return: pd.DataFrame | None 行情DataFrame，空则返回None
+    """
     for attempt in range(max_retry):
         try:
             time.sleep(API_MIN_INTERVAL)
@@ -147,23 +170,33 @@ def ts_pro_bar_with_retry(code, adj, start_date, end_date, max_retry=MAX_RETRY):
         except Exception as e:
             err_msg = str(e)
             if "积分" in err_msg or "permission" in err_msg.lower():
-                raise RuntimeError("❌Tushare积分不足，无法调取数据，请提升账号积分！")
+                raise RuntimeError("❌Tushare积分不足，请提升账号积分")
             if ("访问频率" in err_msg.lower()) or ("adj_factor" in err_msg):
                 if attempt + 1 < max_retry:
                     sleep_sec = 60 + random.uniform(2, 8)
-                    logger.warning(f"Tushare adj_factor限流，随机休眠 {sleep_sec:.1f}s 后重试 {attempt+1}/{max_retry}")
+                    logger.warning(f"Tushare限流，随机休眠 {sleep_sec:.1f}s 重试 {attempt + 1}/{max_retry}")
                     time.sleep(sleep_sec)
             else:
-                logger.warning(f"Tushare请求失败，重试 {attempt+1}/{max_retry}, err:{err_msg}")
-    raise RuntimeError("Tushare接口多次请求失败，请检查网络、token、账号积分")
+                logger.warning(f"Tushare请求失败，重试 {attempt + 1}/{max_retry}, err:{err_msg}")
+    raise RuntimeError("Tushare多次请求失败")
+
 
 def fetch_data(token: str, code: str, start: str, end: str, refresh_cache: bool = False) -> pd.DataFrame:
+    """
+    获取单只股票行情，优先读取本地cache，无缓存则调用tushare接口
+    :param token: tushare token
+    :param code: 股票ts_code
+    :param start: YYYYMMDD 起始时间
+    :param end: YYYYMMDD 结束时间
+    :param refresh_cache: bool True强制重新拉取不读缓存
+    :return: pd.DataFrame 清洗完成的日线行情
+    """
     if not token:
         token = os.getenv("TUSHARE_TOKEN", "").strip()
         if not token:
             token = input('请粘贴你的tushare token：').strip()
             if not token:
-                raise RuntimeError("token不能为空，请配置.env文件或者输入有效的Tushare token")
+                raise RuntimeError("token不能为空，请配置.env或者输入有效token")
     ts.set_token(token)
     cache_file = f"cache_{code.replace('.','_')}_{ADJ_MODE}_{start}_{end}.csv"
     if (not refresh_cache) and os.path.exists(cache_file):
@@ -188,14 +221,13 @@ def fetch_data(token: str, code: str, start: str, end: str, refresh_cache: bool 
         miss_cols = [c for c in required_cols if c not in df_raw.columns]
         if miss_cols:
             raise RuntimeError(f"Tushare返回数据缺少必要字段：{','.join(miss_cols)}，接口返回异常")
-        valid_ratio = (~df_raw[["open","high","low","close","vol"]].isna()).all(axis=1).mean()
+        valid_ratio = (~df_raw[["open", "high", "low", "close", "vol"]].isna()).all(axis=1).mean()
         if valid_ratio < 0.3:
             raise RuntimeError(f"行情数据大量缺失，有效行占比仅{valid_ratio:.1%}，无法继续回测")
         df_raw["trade_date"] = pd.to_datetime(df_raw["trade_date"].astype(str), format="%Y%m%d")
         df_raw_save = df_raw.copy()
         df_raw_save["trade_date"] = df_raw_save["trade_date"].dt.strftime("%Y%m%d")
         df_raw_save.to_csv(cache_file, index=False, encoding="utf-8-sig")
-        logger.info(f"行情已写入缓存文件：{cache_file}")
     start_dt = pd.to_datetime(start, format="%Y%m%d")
     end_dt = pd.to_datetime(end, format="%Y%m%d")
     df = df_raw[(df_raw["trade_date"] >= start_dt) & (df_raw["trade_date"] <= end_dt)].copy()
@@ -207,7 +239,14 @@ def fetch_data(token: str, code: str, start: str, end: str, refresh_cache: bool 
     logger.info(f"成功加载 {code} 日线数据，有效行数 {len(df)}")
     return df
 
+
 def build_features(df: pd.DataFrame) -> pd.DataFrame:
+    """
+    根据原始日线计算全套技术因子与训练标签
+    注意：shift(-1)未来函数，仅离线回测，实盘不可直接使用
+    :param df: 原始日线DataFrame
+    :return: 增加因子、label后的DataFrame
+    """
     df = df.copy()
     df['ma5'] = df['close'].rolling(5).mean()
     df['ma20'] = df['close'].rolling(20).mean()
@@ -235,7 +274,14 @@ def build_features(df: pd.DataFrame) -> pd.DataFrame:
     logger.info(f"样本标签分布：上涨 {up_rate:.2%}，下跌 {1-up_rate:.2%}")
     return df
 
+
 def calc_metrics(net_value: pd.Series, rf: float):
+    """
+    回测绩效指标计算：总收益、年化收益、夏普比率、最大回撤
+    :param net_value: pd.Series 归一化净值序列
+    :param rf: float 无风险年利率
+    :return: dict 指标字典 total_return / annual_return / sharpe / max_drawdown
+    """
     net_value = net_value.dropna()
     if len(net_value) <= 1:
         logger.warning("⚠️净值序列有效数据过少，指标全部置空")
@@ -259,7 +305,17 @@ def calc_metrics(net_value: pd.Series, rf: float):
         "max_drawdown": max_drawdown
     }
 
+
 def ml_backtest(df: pd.DataFrame, train_ratio=0.8, prob_threshold=0.5, n_estimators=200, max_depth=5):
+    """
+    随机森林向量化回测主逻辑，时序划分+TimeSeriesSplit时序交叉验证
+    :param df: 特征+标签完整数据集
+    :param train_ratio: float 训练集划分比例
+    :param prob_threshold: float 持仓概率阈值
+    :param n_estimators: int 树数量
+    :param max_depth: int 树最大深度
+    :return: test_df, importance, cv_mean, cv_std, up_rate, train_acc, test_acc
+    """
     feature_cols = FEATURE_COLS
     split_idx = int(len(df) * train_ratio)
     train_raw = df.iloc[:split_idx].copy()
@@ -274,7 +330,6 @@ def ml_backtest(df: pd.DataFrame, train_ratio=0.8, prob_threshold=0.5, n_estimat
     y_train = train["label"]
     X_test = test[feature_cols]
     y_test = test["label"]
-
     max_cv_split = 5
     n_splits = min(max_cv_split, max(2, len(X_train) // 20))
     logger.info(f"动态设置时序交叉验证折数 n_splits = {n_splits}")
@@ -295,7 +350,6 @@ def ml_backtest(df: pd.DataFrame, train_ratio=0.8, prob_threshold=0.5, n_estimat
     cv_mean = np.mean(cv_scores)
     cv_std = np.std(cv_scores)
     logger.info(f"交叉验证平均准确率: {cv_mean:.4f} ± {cv_std:.4f}")
-
     scaler = StandardScaler()
     X_train_s = scaler.fit_transform(X_train)
     X_test_s = scaler.transform(X_test)
@@ -308,14 +362,11 @@ def ml_backtest(df: pd.DataFrame, train_ratio=0.8, prob_threshold=0.5, n_estimat
     logger.info(f"\n训练集准确率: {train_acc:.4f}")
     logger.info(f"测试集准确率: {test_acc:.4f}")
     logger.info("\n" + classification_report(y_test, y_pred, zero_division=0))
-
     overfit_gap = train_acc - cv_mean
     if overfit_gap > 0.12:
         logger.warning(f"⚠️过拟合风险提示：训练集准确率‑CV平均准确率 = {overfit_gap:.4f}，差距偏大，注意调参")
-
     importance = pd.Series(model.feature_importances_, index=feature_cols).sort_values(ascending=False)
     logger.info(f"\n特征重要性Top5:\n{importance.head()}")
-
     cm = confusion_matrix(y_test, y_pred)
     disp = ConfusionMatrixDisplay(confusion_matrix=cm, display_labels=["下跌", "上涨"])
     fig_cm, ax_cm = plt.subplots(figsize=(6, 5))
@@ -327,12 +378,10 @@ def ml_backtest(df: pd.DataFrame, train_ratio=0.8, prob_threshold=0.5, n_estimat
     except Exception as e:
         logger.warning(f"⚠️混淆矩阵图片保存失败，跳过，err:{str(e)}")
     plt.close(fig_cm)
-
     test = test.copy()
     test.loc[:, "prob_up"] = y_pred_proba
     test.loc[:, "signal"] = y_pred
     test.loc[:, "trade"] = test["signal"].diff().abs()
-
     # 空值防护，ret_1d为NaN填充0，防止cumprod全部变成NaN
     test["ret_1d"] = test["ret_1d"].fillna(0.0)
     cost_per_switch = 2 * COST_RATE + SLIPPAGE
@@ -345,7 +394,15 @@ def ml_backtest(df: pd.DataFrame, train_ratio=0.8, prob_threshold=0.5, n_estimat
     up_rate = df["label"].mean()
     return test, importance, cv_mean, cv_std, up_rate, train_acc, test_acc
 
+
 def plot_result(test_df: pd.DataFrame, importance: pd.Series, stock_code: str, no_plot=False):
+    """
+    绘制向量化回测结果：净值对比图、买卖信号标记、特征重要性柱状图
+    :param test_df: 测试集结果DataFrame
+    :param importance: pd.Series 特征重要性
+    :param stock_code: str 股票代码
+    :param no_plot: bool 是否关闭绘图
+    """
     if no_plot:
         logger.info("📌 --no_plot已开启，跳过绘图")
         return
@@ -359,7 +416,6 @@ def plot_result(test_df: pd.DataFrame, importance: pd.Series, stock_code: str, n
     axes[0].grid(alpha=0.3)
     axes[0].xaxis.set_major_formatter(mdates.DateFormatter('%Y'))
     axes[0].xaxis.set_major_locator(mdates.YearLocator())
-
     axes[1].plot(date_list, test_df["close"], color="gray", alpha=0.5, label="后复权收盘价")
     long = test_df[test_df["signal"] == 1]
     flat = test_df[test_df["signal"] == 0]
@@ -372,7 +428,6 @@ def plot_result(test_df: pd.DataFrame, importance: pd.Series, stock_code: str, n
     axes[1].grid(alpha=0.3)
     axes[1].xaxis.set_major_formatter(mdates.DateFormatter('%Y'))
     axes[1].xaxis.set_major_locator(mdates.YearLocator())
-
     importance.plot(kind="bar", ax=axes[2])
     axes[2].set_title("模型特征重要性")
     axes[2].grid(alpha=0.3)
@@ -385,9 +440,11 @@ def plot_result(test_df: pd.DataFrame, importance: pd.Series, stock_code: str, n
         logger.warning(f"⚠️净值图表保存失败，跳过绘图，err:{str(e)}")
     plt.close(fig)
 
+
 def main():
+    """程序入口，解析命令行参数，执行随机森林向量化回测"""
     parser = argparse.ArgumentParser(
-        description="随机森林股票涨跌预测回测程序，本代码仅学习演示，不构成投资建议"
+        description="随机森林股票涨跌预测回测程序，本代码仅学习演示，不构成任何投资建议"
     )
     parser.add_argument("--version", action="version", version=f"%(prog)s {__version__}")
     parser.add_argument("--code", type=str, default=None, help="股票ts代码，不传进入交互输入")
@@ -414,7 +471,6 @@ def main():
     delta_years = (end_dt - start_dt).days / 365.0
     if delta_years > 8:
         logger.warning(f"⚠️回测时间跨度 {delta_years:.1f} 年，区间较大，容易触发接口限流与内存不足，建议适当缩短区间")
-
     for arg_name, val in [("start", args.start), ("end", args.end)]:
         if not (val.isdigit() and len(val) == 8):
             raise RuntimeError(f"参数 --{arg_name}={val} 格式错误！必须为8位数字 YYYYMMDD，示例：20200101")
@@ -481,18 +537,16 @@ def main():
         )
         ml_metric = calc_metrics(test_df["strategy_net"], RISK_FREE_RATE)
         bh_metric = calc_metrics(test_df["buyhold_net"], RISK_FREE_RATE)
-
         timestamp_str = datetime.now().strftime('%Y%m%d_%H%M%S')
         local_run_time = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
         csv_name = os.path.join(OUTPUT_DIR, f"ml_report_{stock_code.replace('.','_')}_{timestamp_str}.csv")
         export_cols = ["trade_date", "close", "prob_up", "signal", "strategy_ret", "strategy_net", "buyhold_net"]
         test_df[export_cols].to_csv(csv_name, index=False, encoding="utf‑8‑sig")
         logger.info(f"✅回测明细CSV导出 {csv_name}")
-
         txt_name = os.path.join(OUTPUT_DIR, f"ml_summary_{stock_code.replace('.','_')}_{timestamp_str}.txt")
         with open(txt_name, "w", encoding="utf‑8") as f:
             f.write("⚠️本结果仅用于学习演示，不构成任何投资建议。历史回测不能代表未来收益。\n")
-            f.write("⚠️注意：本向量化回测未模拟A股100股最小交易单位；严谨评估请使用event_backtest事件驱动模块\n")
+            f.write("⚠️注意：本向量化回测未模拟A股100股最小交易单位；严谨评估请使用event_backtest.py事件驱动模块\n")
             f.write(f"脚本名称: ml_strategy.py【随机森林简化收益率回测】\n")
             f.write(f"脚本版本: {__version__}\n")
             f.write(f"本地运行时间: {local_run_time}\n")
@@ -513,7 +567,6 @@ def main():
             f.write(f"【买入持有】总收益率:{bh_metric['total_return']:.2%} 年化:{bh_metric['annual_return']:.2%} 夏普:{bh_metric['sharpe']:.3f} 最大回撤:{bh_metric['max_drawdown']:.2%}\n")
             f.write("# End of report\n")
         logger.info(f"✅汇总报告txt导出 {txt_name}")
-
         logger.info("\n" + "=" * 60)
         logger.info(f"{'指标':<16}{'机器学习策略':>14}{'买入持有':>14}")
         logger.info("-" * 60)
@@ -522,16 +575,15 @@ def main():
         logger.info(f"夏普比率    {ml_metric['sharpe']:>13.3f}{bh_metric['sharpe']:>13.3f}")
         logger.info(f"最大回撤    {ml_metric['max_drawdown']:>13.2%}{bh_metric['max_drawdown']:>13.2%}")
         logger.info("=" * 60)
-
         plot_result(test_df, imp, stock_code, no_plot=args.no_plot)
         logger.info("✅全部回测流程执行完成")
-
     except KeyboardInterrupt:
         logger.info("\n👋 用户手动 Ctrl+C 终止程序，正常退出")
     except MemoryError:
-        logger.error("❌内存不足！请缩小回测时间区间，减少行情数据量")
+        logger.error("❌内存不足，请缩小回测时间区间，减少行情数据量")
     except Exception as e:
         logger.error(f"程序异常终止：{str(e)}", exc_info=True)
+
 
 if __name__ == "__main__":
     try:

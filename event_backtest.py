@@ -19,6 +19,7 @@ from dotenv import load_dotenv
 import tushare as ts
 import pandas as pd
 import numpy as np
+
 __version__ = "1.0.6"
 RISK_FREE_RATE = 0.02
 COMMISSION_RATE = 0.0003
@@ -30,16 +31,24 @@ API_MIN_INTERVAL = 0.4
 OUTPUT_DIR = "./output"
 os.makedirs(OUTPUT_DIR, exist_ok=True)
 
+
 def safe_shell_join(args_list):
+    """
+    跨平台安全拼接shell命令参数
+    :param args_list: list[str] 命令参数列表
+    :return: str 拼接完成命令字符串
+    """
     try:
         return shlex.join(args_list)
     except AttributeError:
         return " ".join(shlex.quote(x) for x in args_list)
 
+
 try:
     import importlib.metadata
 except ImportError:
     importlib = None
+
 try:
     import matplotlib
     matplotlib.use('TkAgg')
@@ -66,13 +75,17 @@ else:
 plt.rcParams['font.sans-serif'] = ['Microsoft YaHei', 'SimHei']
 plt.rcParams['axes.unicode_minus'] = False
 
+
 def clear_all_cache():
+    """清除cache_*.csv行情缓存文件"""
     cache_files = glob.glob("cache_*.csv")
     for f in cache_files:
         os.remove(f)
-    logging.info(f"✅已清理行情缓存，共删除 {len(cache_files)} 个")
+        logging.info(f"✅已清理行情缓存，共删除 {len(cache_files)} 个")
+
 
 def clean_all_output():
+    """清理事件驱动回测输出产物，保留行情cache缓存"""
     patterns = [
         os.path.join(OUTPUT_DIR, "event_result_*.png"),
         os.path.join(OUTPUT_DIR, "event_backtest_report_*.csv"),
@@ -86,7 +99,12 @@ def clean_all_output():
             cnt += 1
     print(f"🧹已清理事件驱动输出报告/图片，共删除 {cnt} 个；行情cache缓存已保留")
 
+
 def setup_logger():
+    """
+    初始化日志，同时输出控制台与日志文件event_backtest.log
+    :return: logging.Logger 日志实例
+    """
     log_path = os.path.join(OUTPUT_DIR, "event_backtest.log")
     log_format = "%(asctime)s - %(levelname)s - %(message)s"
     logging.basicConfig(
@@ -99,9 +117,20 @@ def setup_logger():
     )
     return logging.getLogger(__name__)
 
+
 logger = setup_logger()
 
+
 def ts_pro_bar_with_retry(code, adj, start_date, end_date, max_retry=MAX_RETRY):
+    """
+    tushare pro_bar接口带重试，处理限流、积分异常
+    :param code: str ts股票代码
+    :param adj: str 复权模式 hfq/qfq
+    :param start_date: str YYYYMMDD
+    :param end_date: str YYYYMMDD
+    :param max_retry: int 最大重试次数
+    :return: pd.DataFrame|None 行情数据，失败返回None
+    """
     for attempt in range(max_retry):
         try:
             time.sleep(API_MIN_INTERVAL)
@@ -123,10 +152,22 @@ def ts_pro_bar_with_retry(code, adj, start_date, end_date, max_retry=MAX_RETRY):
                 logger.warning(f"Tushare请求失败，重试 {attempt+1}/{max_retry}, err:{err_msg}")
     raise RuntimeError("Tushare接口多次请求失败，请检查网络、token、账号积分")
 
+
 class Event:
+    """事件基类，所有事件继承此类"""
     pass
 
+
 class MarketEvent(Event):
+    """
+    行情K线事件，保存单根K线信息
+    :param date: datetime 交易日期
+    :param open_: float 开盘价
+    :param high: float 最高价
+    :param low: float 最低价
+    :param close: float 收盘价
+    :param volume: float 成交量
+    """
     def __init__(self, date, open_, high, low, close, volume):
         self.type = "MARKET"
         self.date = date
@@ -136,20 +177,43 @@ class MarketEvent(Event):
         self.close = close
         self.volume = volume
 
+
 class SignalEvent(Event):
+    """
+    策略信号事件，策略产生买卖信号
+    :param date: datetime 信号产生日期
+    :param signal: int 1买入，-1卖出
+    """
     def __init__(self, date, signal):
         self.type = "SIGNAL"
         self.date = date
         self.signal = signal
 
+
 class OrderEvent(Event):
+    """
+    订单事件，待执行的委托订单
+    :param date: datetime 订单日期
+    :param direction: str BUY / SELL
+    :param quantity: int 委托股数
+    """
     def __init__(self, date, direction, quantity):
         self.type = "ORDER"
         self.date = date
         self.direction = direction
         self.quantity = quantity
 
+
 class FillEvent(Event):
+    """
+    成交事件，订单撮合完成之后生成
+    :param fill_date: datetime 成交日期
+    :param direction: str BUY / SELL
+    :param quantity: int 成交股数
+    :param price: float 成交价格
+    :param commission: float 手续费率
+    :param stamp_tax: float 印花税率
+    """
     def __init__(self, fill_date, direction, quantity, price, commission, stamp_tax):
         self.type = "FILL"
         self.fill_date = fill_date
@@ -159,12 +223,22 @@ class FillEvent(Event):
         self.commission = commission
         self.stamp_tax = stamp_tax
 
+
 class DataHandler:
+    """
+    行情迭代器，逐根K线输出MarketEvent
+    :param df: pd.DataFrame 已经排好序的日线DataFrame
+    """
     def __init__(self, df: pd.DataFrame):
         self.df = df.reset_index(drop=True)
         self.df["trade_date"] = pd.to_datetime(self.df["trade_date"])
         self.idx = 0
+
     def next_bar(self):
+        """
+        获取下一根K线行情事件
+        :return: MarketEvent|None 无更多数据返回None
+        """
         if self.idx >= len(self.df):
             return None
         row = self.df.iloc[self.idx]
@@ -177,14 +251,26 @@ class DataHandler:
         self.idx += 1
         return bar
 
+
 class MAStrategy:
+    """
+    双均线金叉死叉策略，根据短、长期均线生成SignalEvent
+    :param short_window: int 短期均线周期
+    :param long_window: int 长期均线周期
+    """
     def __init__(self, short_window=10, long_window=30):
         self.short_window = short_window
         self.long_window = long_window
         self.price_series = pd.Series(dtype=float)
         self.buy_points = []
         self.sell_points = []
+
     def calculate_signal(self, bar: MarketEvent):
+        """
+        接收单根行情K线，计算交易信号
+        :param bar: MarketEvent
+        :return: SignalEvent|None 有信号返回事件，无信号返回None
+        """
         self.price_series.loc[bar.date] = bar.close
         if len(self.price_series) < self.long_window:
             return None
@@ -204,7 +290,12 @@ class MAStrategy:
             return SignalEvent(bar.date, signal=-1)
         return None
 
+
 class Portfolio:
+    """
+    投资组合账户类：管理现金、持仓、每日净值曲线、成交记录，模拟A股最小1手交易
+    :param initial_capital: float 初始账户资金
+    """
     def __init__(self, initial_capital=100000.0):
         self.initial_capital = initial_capital
         self.cash = initial_capital
@@ -215,6 +306,10 @@ class Portfolio:
         self.trade_records = []
 
     def update_market(self, bar: MarketEvent):
+        """
+        接收最新行情，更新账户市值，写入净值曲线
+        :param bar: MarketEvent
+        """
         self.current_price = bar.close
         total_value = self.cash + self.position * self.current_price
         self.equity_curve.append({
@@ -225,13 +320,16 @@ class Portfolio:
         })
 
     def generate_order(self, signal_event: SignalEvent, estimate_open_price: float):
-        # 价格合法性防护，防止0/NaN造成除零异常
+        """
+        根据信号事件生成委托OrderEvent，处理100股最小交易单位、资金不足判断
+        :param signal_event: SignalEvent 买卖信号
+        :param estimate_open_price: float 预估开盘成交价格
+        :return: OrderEvent|None 无法下单返回None
+        """
         if np.isnan(estimate_open_price) or estimate_open_price <= 1e-6:
             logger.warning(f"⚠️价格异常 estimate_open_price={estimate_open_price},跳过生成订单")
             return None
-
         if signal_event.signal == 1 and self.position == 0:
-            # 预扣手续费+滑点，防止现金为负
             per_lot_cost = estimate_open_price * 100 * (1 + COMMISSION_RATE + SLIPPAGE)
             max_lots = int(self.cash / per_lot_cost)
             quantity = max_lots * 100
@@ -245,7 +343,6 @@ class Portfolio:
                     f"但账户仅剩现金{self.cash:,.2f}元，缺口≈{per_lot_cost - self.cash:,.2f}元"
                 )
         elif signal_event.signal == -1 and self.position > 0:
-            # v1.0.6新增：卖出同样校验价格合法性
             if np.isnan(estimate_open_price) or estimate_open_price <= 1e-6:
                 logger.warning(f"⚠️卖出价格异常 estimate_open_price={estimate_open_price}，跳过生成卖出订单")
                 return None
@@ -254,6 +351,10 @@ class Portfolio:
         return None
 
     def update_fill(self, fill_event: FillEvent):
+        """
+        接收成交FillEvent，更新现金、持仓、成交记录
+        :param fill_event: FillEvent 撮合完成的成交事件
+        """
         cost = fill_event.quantity * fill_event.price
         commission = cost * fill_event.commission
         stamp_tax_amount = cost * fill_event.stamp_tax
@@ -295,10 +396,22 @@ class Portfolio:
                 "trade_profit": profit
             })
 
+
 class ExecutionHandler:
+    """
+    订单执行器：模拟滑点，把OrderEvent撮合转换为FillEvent成交事件
+    :param slippage: float 滑点系数
+    """
     def __init__(self, slippage: float):
         self.slippage = slippage
+
     def execute(self, order: OrderEvent, next_bar: MarketEvent) -> FillEvent:
+        """
+        执行委托订单，应用滑点规则返回成交事件
+        :param order: 待执行订单OrderEvent
+        :param next_bar: 下一根K线，使用开盘价撮合
+        :return: FillEvent 成交事件
+        """
         if np.isnan(next_bar.open_) or next_bar.open_ <= 1e-6:
             raise RuntimeError(f"next_bar.open_价格异常 {next_bar.open_}")
         if order.direction == "BUY":
@@ -315,13 +428,26 @@ class ExecutionHandler:
             stamp_tax=tax
         )
 
+
 class BacktestEngine:
+    """
+    事件驱动回测引擎，串联数据、策略、账户、执行器完整回测流程
+    :param df: pd.DataFrame 已清洗日线数据
+    :param initial_capital: float 初始资金
+    :param short_window: int 短期均线
+    :param long_window: int 长期均线
+    """
     def __init__(self, df: pd.DataFrame, initial_capital=100000.0, short_window=10, long_window=30):
         self.df = df
         self.initial_capital = initial_capital
         self.short_window = short_window
         self.long_window = long_window
+
     def run(self):
+        """
+        启动回测主循环，逐事件驱动运行
+        :return: equity_df,buy_points,sell_points,trade_records
+        """
         data_handler = DataHandler(self.df)
         strategy = MAStrategy(self.short_window, self.long_window)
         portfolio = Portfolio(self.initial_capital)
@@ -345,7 +471,14 @@ class BacktestEngine:
             logger.warning("⚠️本次回测没有产生任何一笔实际成交，请检查均线参数或者行情数据")
         return pd.DataFrame(portfolio.equity_curve), strategy.buy_points, strategy.sell_points, portfolio.trade_records
 
+
 def calc_metrics(equity_df: pd.DataFrame, rf: float):
+    """
+    回测指标计算：总收益、年化收益、夏普比率、最大回撤
+    :param equity_df: pd.DataFrame 账户净值曲线，包含date、equity字段
+    :param rf: float 无风险年利率
+    :return: total_return, annual_return, sharpe, max_dd, net_series
+    """
     net = equity_df["equity"] / equity_df["equity"].iloc[0]
     net = net.dropna()
     if len(net) <= 1:
@@ -365,13 +498,31 @@ def calc_metrics(equity_df: pd.DataFrame, rf: float):
     max_dd = ((net - cummax) / cummax).min()
     return total_return, annual_return, sharpe, max_dd, net
 
+
 def auto_calc_capital(df: pd.DataFrame) -> float:
+    """
+    根据行情最高价自动估算建议初始资金
+    :param df: pd.DataFrame 日线行情
+    :return: float 建议资金
+    """
     max_price = df["close"].max()
     suggested_capital = max_price * 1000 * 1.15
     suggested_capital = np.ceil(suggested_capital / 10000) * 10000
     return float(suggested_capital)
 
+
 def plot_chart(equity_df: pd.DataFrame, net_series, bh_df, stock_code, buy_points, sell_points, short_window, long_window):
+    """
+    绘制回测净值对比图：策略净值 vs 买入持有，标记买卖点
+    :param equity_df: 账户净值DataFrame
+    :param net_series: 策略归一化净值
+    :param bh_df: 买入持有数据
+    :param stock_code: str 股票代码
+    :param buy_points: list 买入信号日期列表
+    :param sell_points: list 卖出信号日期列表
+    :param short_window: int 短期均线
+    :param long_window: int 长期均线
+    """
     fig, axes = plt.subplots(2, 1, figsize=(14, 8))
     axes[0].plot(equity_df["date"], net_series, label="事件驱动双均线策略", linewidth=1.5, color="#1f77b4")
     axes[0].plot(bh_df["trade_date"], bh_df["bh_net"], label="买入持有", alpha=0.7, color="#ff7f0e")
@@ -402,7 +553,16 @@ def plot_chart(equity_df: pd.DataFrame, net_series, bh_df, stock_code, buy_point
         logger.warning(f"⚠️净值图表保存失败，跳过绘图，err:{str(e)}")
     plt.close(fig)
 
+
 def fetch_data(token: str, code: str, start: str, end: str) -> pd.DataFrame:
+    """
+    获取股票日线行情，优先读取本地缓存，无缓存调用tushare
+    :param token: tushare token字符串
+    :param code: ts股票代码
+    :param start: YYYYMMDD
+    :param end: YYYYMMDD
+    :return: pd.DataFrame 清洗、排序之后日线数据
+    """
     if not token:
         token = os.getenv("TUSHARE_TOKEN", "").strip()
         if not token:
@@ -449,7 +609,9 @@ def fetch_data(token: str, code: str, start: str, end: str) -> pd.DataFrame:
     logger.info(f"成功加载 {code} 日线数据，共 {len(df)} 条")
     return df
 
+
 def main():
+    """程序入口，解析命令行参数，执行双均线事件驱动回测"""
     parser = argparse.ArgumentParser(
         description="事件驱动双均线回测框架，本代码仅学习演示，不构成投资建议"
     )
@@ -465,18 +627,15 @@ def main():
     parser.add_argument("--clear_cache", action="store_true", help="清除cache_*.csv行情缓存")
     parser.add_argument("--clean_output", action="store_true", help="清理事件驱动输出图片/报告日志，保留缓存")
     args = parser.parse_args()
-
     if args.clean_output:
         clean_all_output()
     if args.clear_cache:
         clear_all_cache()
-
     start_dt = pd.to_datetime(args.start, format="%Y%m%d")
     end_dt = pd.to_datetime(args.end, format="%Y%m%d")
     delta_years = (end_dt - start_dt).days / 365.0
     if delta_years > 8:
         logger.warning(f"⚠️回测时间跨度 {delta_years:.1f} 年，区间较大，容易触发接口限流与内存不足，建议适当缩短区间")
-
     for arg_name, val in [("start", args.start), ("end", args.end)]:
         if not (val.isdigit() and len(val) == 8):
             raise RuntimeError(f"参数 --{arg_name}={val} 格式错误！必须为8位数字 YYYYMMDD，示例：20200101")
@@ -484,24 +643,21 @@ def main():
         raise RuntimeError("均线周期不能小于1")
     if args.short >= args.long:
         logger.warning("提示：短期均线大于等于长期均线，策略逻辑反常，请确认参数")
-
     logger.info("========== 程序启动参数 ==========")
     logger.info(f"脚本版本: {__version__}")
     for k, v in vars(args).items():
         logger.info(f"{k:20s}: {v}")
     logger.info("==================================")
-
     shell_cmd_parts = ["python", "event_backtest.py"]
     if args.code:
         shell_cmd_parts.extend(["--code", args.code])
     shell_cmd_parts.extend(["--start", args.start, "--end", args.end])
     if args.token:
-        shell_cmd_parts.extend(["--token", args.token])
+        shell_parts.extend(["--token", args.token])
     shell_cmd_parts.extend(["--short", str(args.short), "--long", str(args.long)])
     if args.capital is not None:
         shell_cmd_parts.extend(["--capital", str(args.capital)])
     run_shell_cmd = safe_shell_join(shell_cmd_parts)
-
     default_code = "600519.SH"
     if args.code is not None:
         stock_code = args.code.upper()
@@ -510,7 +666,6 @@ def main():
         print("-" * 60)
         user_input = input(f"请输入股票代码(回车使用默认 {default_code})：").strip()
         stock_code = user_input.upper() if user_input else default_code
-
     logger.info(f"回测标的 {stock_code}，时间区间 {args.start} ~ {args.end}")
     try:
         df_raw = fetch_data(token=args.token, code=stock_code, start=args.start, end=args.end)
@@ -547,7 +702,6 @@ def main():
         engine = BacktestEngine(df_raw, initial_capital=initial_capital, short_window=args.short, long_window=args.long)
         equity_df, buy_points, sell_points, trade_records = engine.run()
         total_ret, annual_ret, sharpe, max_dd, net_series = calc_metrics(equity_df, RISK_FREE_RATE)
-
         bh_df = df_raw[["trade_date", "close"]].copy()
         bh_df["bh_net"] = bh_df["close"] / bh_df["close"].iloc[0]
         timestamp = datetime.now().strftime('%Y%m%d_%H%M%S')
@@ -555,12 +709,10 @@ def main():
         csv_name = os.path.join(OUTPUT_DIR, f"event_backtest_report_{stock_code.replace('.','_')}_{timestamp}.csv")
         equity_df.to_csv(csv_name, index=False, encoding="utf‑8‑sig")
         logger.info(f"✅每日账户明细导出 {csv_name}")
-
         trade_df = pd.DataFrame(trade_records)
         trade_csv = os.path.join(OUTPUT_DIR, f"event_trade_records_{stock_code.replace('.','_')}_{timestamp}.csv")
         trade_df.to_csv(trade_csv, index=False, encoding="utf‑8‑sig")
         logger.info(f"✅每笔成交记录导出 {trade_csv}")
-
         txt_name = os.path.join(OUTPUT_DIR, f"event_summary_{stock_code.replace('.','_')}_{timestamp}.txt")
         with open(txt_name,"w",encoding="utf‑8") as f:
             f.write("⚠️本结果仅用于学习演示，不构成任何投资建议。历史回测不能代表未来收益。\n")
@@ -579,7 +731,6 @@ def main():
             f.write(f"可复现运行命令:\n{run_shell_cmd}\n")
             f.write("# End of report\n")
         logger.info(f"✅汇总报告txt导出 {txt_name}")
-
         logger.info("\n" + "=" * 60)
         bh_total = float(bh_df["bh_net"].iloc[-1]) - 1
         bh_years = (bh_df["trade_date"].iloc[-1] - bh_df["trade_date"].iloc[0]).days / 365.0
@@ -592,16 +743,15 @@ def main():
         logger.info(f"最大回撤    {max_dd:>13.2%}{'—':>13}")
         logger.info(f"成交笔数    {len(trade_records):>13d}{'—':>13}")
         logger.info("=" * 60)
-
         plot_chart(equity_df, net_series, bh_df, stock_code, buy_points, sell_points, args.short, args.long)
         logger.info("✅事件驱动回测全部流程执行完成")
-
     except KeyboardInterrupt:
         logger.info("\n👋 用户手动 Ctrl+C 终止程序，正常退出")
     except MemoryError:
-        logger.error("❌内存不足！请缩小回测时间区间，减少行情数据量")
+        logger.error("❌内存不足！请缩小回测时间区间或者减少股票数量")
     except Exception as e:
         logger.error(f"程序异常终止：{str(e)}", exc_info=True)
+
 
 if __name__ == "__main__":
     try:
@@ -611,4 +761,4 @@ if __name__ == "__main__":
     except MemoryError:
         logger.error("❌内存不足，请缩小回测区间")
     except Exception as e:
-        logger.error(f"顶层异常终止 {str(e)}", exc_info=True)
+        logger.error(f"顶层程序异常终止 {str(e)}", exc_info=True)
